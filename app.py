@@ -2,7 +2,6 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-from streamlit_drawable_canvas import st_canvas
 import io
 
 GC_BGD    = cv2.GC_BGD
@@ -12,21 +11,20 @@ GC_PR_FGD = cv2.GC_PR_FGD
 
 st.set_page_config(page_title="Background Remover", layout="wide")
 st.title("Background Remover")
-st.caption("Draw a rectangle around your subject to remove the background using GrabCut segmentation.")
+st.caption("Upload an image, position the rectangle around your subject, then remove the background.")
 
 with st.sidebar:
     st.header("Settings")
-    iterations = st.slider("GrabCut Iterations", 1, 15, 5,
-                           help="More = more accurate, slower")
+    iterations = st.slider("GrabCut Iterations", 1, 15, 5)
     st.markdown("---")
     st.markdown("**How to use**")
-    st.markdown("1. Upload a photo\n2. Draw a rectangle around your subject\n3. Click **Remove Background**\n4. Download the transparent PNG")
+    st.markdown("1. Upload a photo\n2. Use the sliders to position the rectangle tightly around your subject\n3. Click **Remove Background**\n4. Download the transparent PNG")
     st.markdown("---")
     st.markdown("**How GrabCut works**")
     st.markdown(
         "- Rectangle seeds the foreground region\n"
         "- Gaussian Mixture Models learn FG and BG colour distributions\n"
-        "- Graph cut finds the optimal boundary between them\n"
+        "- Graph cut finds the optimal boundary\n"
         "- Iterates until convergence"
     )
 
@@ -39,68 +37,57 @@ if uploaded is None:
 file_bytes = np.frombuffer(uploaded.read(), np.uint8)
 img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-# resize for display — keep it manageable
 h, w = img_bgr.shape[:2]
-MAX_DISPLAY = 700
-scale = min(MAX_DISPLAY / w, MAX_DISPLAY / h, 1.0)
-disp_w = int(w * scale)
-disp_h = int(h * scale)
-img_disp = cv2.resize(img_bgr, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
-img_rgb  = cv2.cvtColor(img_disp, cv2.COLOR_BGR2RGB)
+if max(h, w) > 1200:
+    s = 1200 / max(h, w)
+    img_bgr = cv2.resize(img_bgr, (int(w*s), int(h*s)))
+    h, w = img_bgr.shape[:2]
 
-st.markdown("### Draw a rectangle around your subject")
-st.caption("Click and drag to draw. Try to include a little margin around the subject. Redraw to adjust.")
+img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-canvas_result = st_canvas(
-    fill_color="rgba(124, 111, 247, 0.15)",
-    stroke_width=2,
-    stroke_color="#7c6ff7",
-    background_image=Image.fromarray(img_rgb),
-    update_streamlit=True,
-    width=disp_w,
-    height=disp_h,
-    drawing_mode="rect",
-    key="canvas",
-)
+# ── rectangle sliders ─────────────────────────────────────────────────────────
+st.markdown("### Position the rectangle around your subject")
+st.caption("The purple rectangle updates live as you move the sliders. Get it as tight as possible around your subject.")
 
-run = st.button("Remove Background", type="primary")
+col1, col2 = st.columns(2)
+with col1:
+    left   = st.slider("Left edge",   0, w-2,  w//6,  key="left")
+    right  = st.slider("Right edge",  left+1, w, w - w//6, key="right")
+with col2:
+    top    = st.slider("Top edge",    0, h-2,  h//6,  key="top")
+    bottom = st.slider("Bottom edge", top+1, h, h - h//6, key="bottom")
 
-if not run:
+# live preview with rectangle drawn on image
+preview = img_rgb.copy()
+cv2.rectangle(preview, (left, top), (right, bottom), (124, 111, 247), 3)
+# dim outside the rectangle so subject stands out
+overlay = preview.copy()
+overlay[:top,  :] = (overlay[:top,  :] * 0.4).astype(np.uint8)
+overlay[bottom:,:] = (overlay[bottom:,:] * 0.4).astype(np.uint8)
+overlay[top:bottom, :left]  = (overlay[top:bottom, :left]  * 0.4).astype(np.uint8)
+overlay[top:bottom, right:] = (overlay[top:bottom, right:] * 0.4).astype(np.uint8)
+
+st.image(overlay, caption="Live preview — adjust sliders until the rectangle tightly wraps your subject", use_container_width=True)
+
+rect_w = right - left
+rect_h = bottom - top
+st.caption(f"Rectangle: {rect_w}×{rect_h}px  |  Subject area: {rect_w*rect_h//(w*h//100)}% of image")
+
+# ── run ───────────────────────────────────────────────────────────────────────
+if not st.button("Remove Background", type="primary"):
     st.stop()
 
-# ── extract rectangle from canvas ────────────────────────────────────────────
-if canvas_result.json_data is None or not canvas_result.json_data.get("objects"):
-    st.warning("Please draw a rectangle on the image first.")
+if rect_w < 20 or rect_h < 20:
+    st.error("Rectangle too small — adjust the sliders.")
     st.stop()
 
-obj = canvas_result.json_data["objects"][-1]  # use last drawn rect
-
-# canvas gives left, top, width, height in display coords
-cx = int(obj["left"])
-cy = int(obj["top"])
-cw = int(obj["width"])
-ch = int(obj["height"])
-
-if cw < 10 or ch < 10:
-    st.warning("Rectangle too small — draw a larger box around your subject.")
-    st.stop()
-
-# scale back to full resolution
-x1 = max(0, int(cx / scale))
-y1 = max(0, int(cy / scale))
-x2 = min(w, int((cx + cw) / scale))
-y2 = min(h, int((cy + ch) / scale))
-rect_w = x2 - x1
-rect_h = y2 - y1
-
-# ── run GrabCut ───────────────────────────────────────────────────────────────
 with st.spinner("Running GrabCut segmentation…"):
     mask      = np.zeros((h, w), dtype=np.uint8)
     bgd_model = np.zeros((1, 65), dtype=np.float64)
     fgd_model = np.zeros((1, 65), dtype=np.float64)
 
     try:
-        cv2.grabCut(img_bgr, mask, (x1, y1, rect_w, rect_h),
+        cv2.grabCut(img_bgr, mask, (left, top, rect_w, rect_h),
                     bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_RECT)
     except Exception as e:
         st.error(f"GrabCut failed: {e}")
@@ -110,48 +97,37 @@ with st.spinner("Running GrabCut segmentation…"):
         (mask == GC_FGD) | (mask == GC_PR_FGD), 255, 0
     ).astype(np.uint8)
 
-    # mask visualisation
     mask_vis = np.zeros((h, w, 3), dtype=np.uint8)
     mask_vis[mask == GC_FGD]    = [80,  220, 80]
     mask_vis[mask == GC_PR_FGD] = [180, 220, 180]
     mask_vis[mask == GC_PR_BGD] = [80,  80,  100]
     mask_vis[mask == GC_BGD]    = [20,  20,  30]
 
-    # checkerboard transparency preview
     board = np.zeros((h, w, 3), dtype=np.uint8)
     sz = 16
     for y in range(0, h, sz):
         for x in range(0, w, sz):
-            val = 200 if (x//sz + y//sz) % 2 == 0 else 230
-            board[y:y+sz, x:x+sz] = val
+            board[y:y+sz, x:x+sz] = 200 if (x//sz + y//sz) % 2 == 0 else 230
 
     fg_3ch = cv2.merge([fg_mask, fg_mask, fg_mask])
-    img_rgb_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    cutout = np.where(fg_3ch == 255, img_rgb_full, board)
+    cutout = np.where(fg_3ch == 255, img_rgb, board)
 
-    # transparent PNG
     bgra        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
     bgra[:,:,3] = fg_mask
 
 # ── results ───────────────────────────────────────────────────────────────────
 st.markdown("### Results")
 c1, c2, c3 = st.columns(3)
-
 with c1:
-    st.image(img_rgb_full, caption="Original", use_container_width=True)
+    st.image(img_rgb,    caption="Original",           use_container_width=True)
 with c2:
-    st.image(mask_vis,
-             caption="Segmentation mask — bright green=definite FG, light=probable FG, dark=BG",
-             use_container_width=True)
+    st.image(mask_vis,   caption="Segmentation mask",  use_container_width=True)
 with c3:
-    st.image(cutout,
-             caption="Cutout (checkerboard = transparent)",
-             use_container_width=True)
+    st.image(cutout,     caption="Cutout (checkerboard = transparent)", use_container_width=True)
 
 fg_pct = int(np.sum(fg_mask > 0) / fg_mask.size * 100)
 st.info(f"Foreground: {fg_pct}% of image  |  {np.sum(fg_mask > 0):,} pixels kept")
 
-# ── download ──────────────────────────────────────────────────────────────────
 pil_out = Image.fromarray(cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA))
 buf = io.BytesIO()
 pil_out.save(buf, format="PNG")
@@ -165,4 +141,4 @@ st.download_button(
     type="primary",
 )
 
-st.caption("Tip: if the result is rough, increase GrabCut Iterations in the sidebar and click Remove Background again.")
+st.caption("Tip: if edges look rough, increase GrabCut Iterations in the sidebar and run again.")
